@@ -506,12 +506,16 @@ pub fn validate_entities(input: &str) -> serde_json::Result<Answer> {
 
     match CedarEntities::from_json_value(validate_entity_call.entities, Some(&schema)) {
         Err(error) => {
+            // Unwrap only the variants whose own `Display` impl summarizes instead of
+            // delegating, so the caller keeps the specific inner diagnostic. The rest
+            // are `#[error(transparent)]` or already interpolate their source, so the
+            // catch-all preserves their detail and keeps this compiling when upstream
+            // adds a variant.
             let err_message = match error {
-                EntitiesError::Serialization(err) => err.to_string(),
                 EntitiesError::Deserialization(err) => err.to_string(),
-                EntitiesError::Duplicate(err) => err.to_string(),
                 EntitiesError::TransitiveClosureError(err) => err.to_string(),
                 EntitiesError::InvalidEntity(err) => err.to_string(),
+                err => err.to_string(),
             };
             Ok(Answer::fail_bad_request(vec![err_message]))
         }
