@@ -22,13 +22,13 @@ use cedar_policy::ffi::{
 };
 use cedar_policy::{
     ffi::{is_authorized_json_str, validate_json_str},
-    Authorizer, Entities as CedarEntities, EntityUid, Policy, PolicySet, Request, Schema, SlotId,
-    Template,
+    Authorizer, Entities as CedarEntities, EntityUid, ParseErrors, Policy, PolicySet, Request,
+    Schema, SlotId, Template,
 };
 use cedar_policy_formatter::{policies_str_to_pretty, Config};
 use dashmap::DashMap;
 use jni::{
-    objects::{JClass, JObject, JString, JValueGen, JValueOwned},
+    objects::{JClass, JObject, JString, JThrowable, JValueGen, JValueOwned},
     sys::{jstring, jvalue},
     JNIEnv,
 };
@@ -534,6 +534,77 @@ struct JavaInterfaceCall {
     arguments: String,
 }
 
+/// Throw a `PolicyParseException` carrying Cedar's structured diagnostics for each parse
+/// error.
+///
+/// `jni_failed` reduces any error to `format!("Internal JNI Error: {e}")`, which for a parse
+/// failure discards everything `miette` recorded — the source span, the tokens the parser
+/// expected, the help text — and, because `ParseErrors`' `Display` prints only its first
+/// error, every subsequent error too. Parse failures are the errors a policy author is most
+/// likely to hit and the ones where that detail matters most, so they are additionally
+/// converted to `DetailedError` (the same representation the validation path already
+/// returns) and handed to Java intact.
+///
+/// The `"Internal JNI Error: "` prefix is dropped for these: it describes the binding
+/// rather than the policy, and reading "Internal error" for an ordinary typo suggests a
+/// library fault rather than something the caller can fix. `getErrors()` likewise carries
+/// one entry per parse error instead of a single entry for the whole document.
+fn throw_parse_errors(env: &mut JNIEnv<'_>, errs: &ParseErrors) {
+    if env.exception_check().unwrap_or_default() {
+        return; // An exception is already in flight; let it propagate.
+    }
+    let details: Vec<DetailedError> = errs.iter().map(DetailedError::from).collect();
+    let messages: Vec<String> = details.iter().map(|d| d.message.clone()).collect();
+    let details_json = serde_json::to_string(&details).unwrap_or_default();
+
+    // Fall back to the generic path if any part of building the richer exception fails, so
+    // a parse error is never silently turned into a different kind of failure.
+    match build_parse_exception(env, &messages, &details_json) {
+        Ok(exception) => {
+            if env.throw(exception).is_err() {
+                throw_internal(env, errs);
+            }
+        }
+        Err(_) => throw_internal(env, errs),
+    }
+}
+
+/// Build `PolicyParseException(String[] messages, String detailedErrorsJson)`.
+fn build_parse_exception<'a>(
+    env: &mut JNIEnv<'a>,
+    messages: &[String],
+    details_json: &str,
+) -> Result<JThrowable<'a>> {
+    let string_class = env.find_class("java/lang/String")?;
+    let messages_array =
+        env.new_object_array(messages.len() as i32, &string_class, JObject::null())?;
+    for (i, message) in messages.iter().enumerate() {
+        let jmessage = env.new_string(message)?;
+        env.set_object_array_element(&messages_array, i as i32, jmessage)?;
+    }
+    let jdetails = env.new_string(details_json)?;
+    let exception = env.new_object(
+        "com/cedarpolicy/model/exception/PolicyParseException",
+        "([Ljava/lang/String;Ljava/lang/String;)V",
+        &[
+            JValueGen::Object(&messages_array),
+            JValueGen::Object(&jdetails),
+        ],
+    )?;
+    Ok(JThrowable::from(exception))
+}
+
+/// Throw a plain `InternalException`, exactly as `jni_failed` would have.
+fn throw_internal(env: &mut JNIEnv<'_>, errs: &ParseErrors) {
+    // We have to unwrap here as we're doing exception handling
+    // If we don't have the heap space to create an exception, the only valid move is ending the process
+    env.throw_new(
+        "com/cedarpolicy/model/exception/InternalException",
+        format!("Internal JNI Error: {errs}"),
+    )
+    .unwrap();
+}
+
 fn jni_failed(env: &mut JNIEnv<'_>, e: &dyn Error) -> jvalue {
     // If we already generated an exception, then let that go up the stack
     // Otherwise, generate a cedar InternalException and return null
@@ -655,7 +726,13 @@ fn policy_set_to_json_internal<'a>(
 #[jni_fn("com.cedarpolicy.model.policy.PolicySet")]
 pub fn parsePoliciesJni<'a>(mut env: JNIEnv<'a>, _: JClass, policies_jstr: JString<'a>) -> jvalue {
     match parse_policies_internal(&mut env, policies_jstr) {
-        Err(e) => jni_failed(&mut env, e.as_ref()),
+        Err(e) => match e.downcast_ref::<ParseErrors>() {
+            Some(parse_errors) => {
+                throw_parse_errors(&mut env, parse_errors);
+                JValueOwned::Object(JObject::null()).as_jni()
+            }
+            None => jni_failed(&mut env, e.as_ref()),
+        },
         Ok(policies_set) => policies_set.as_jni(),
     }
 }
